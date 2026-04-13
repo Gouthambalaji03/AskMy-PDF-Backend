@@ -2,74 +2,75 @@
  * chatService.ts — LLM Chat Completion with Context (Google Gemini)
  *
  * =============================================================
- * RAG CONCEPT: What is "context window" and why RAG solves it
+ * TIER 2: Metadata-Aware Prompt Engineering
  * =============================================================
  *
- * Every LLM has a "context window" — the maximum amount of text
- * it can read and process in a single request. Think of it as
- * the AI's short-term memory:
+ * Updated to include chunk metadata (page number, section heading)
+ * in the context sent to the LLM. This allows the AI to cite
+ * specific pages and sections in its answers, making responses
+ * more trustworthy and verifiable.
  *
- *   - Gemini 2.0 Flash: ~1,000,000 tokens
- *   - GPT-4o-mini: ~128,000 tokens
- *   - Claude 3.5: ~200,000 tokens
- *
- * Even though 1M tokens sounds like a lot, there are problems
- * with just dumping an entire PDF into the context:
- *
- *   1. COST: You pay per token. Sending 100 pages when you only
- *      need 3 paragraphs wastes money on every single query.
- *
- *   2. ACCURACY: LLMs can get "lost" in very long contexts.
- *      They perform better when given focused, relevant info.
- *      (This is called the "lost in the middle" problem.)
- *
- *   3. SCALE: What if you have 50 PDFs? That's way more than
- *      any context window can handle.
- *
- * RAG solves this by RETRIEVING only the relevant chunks first,
- * then passing just those chunks (+ the question) to the LLM.
- * The LLM gets exactly the context it needs — nothing more.
- *
- * This is the "Augmented Generation" part of RAG:
- *   R = Retrieve relevant chunks (embedding + cosine similarity)
- *   A = Augment the prompt with those chunks
- *   G = Generate an answer using the LLM
+ * The system prompt instructs the LLM to:
+ *   - Reference page numbers when citing information
+ *   - Mention section headings for navigation
+ *   - Indicate the match type (semantic/keyword/hybrid)
  * =============================================================
  */
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { SearchResult } from "./embeddingService";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// Get the chat model instance with a system instruction
+const PRIMARY_MODEL = "gemini-2.5-flash";
+const FALLBACK_MODEL = "gemini-2.0-flash";
+
 const chatModel = genAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
+  model: PRIMARY_MODEL,
   generationConfig: {
-    temperature: 0.3, // Low temperature = more focused, less creative answers
+    temperature: 0.3,
+    maxOutputTokens: 1000,
+  },
+});
+
+const fallbackModel = genAI.getGenerativeModel({
+  model: FALLBACK_MODEL,
+  generationConfig: {
+    temperature: 0.3,
     maxOutputTokens: 1000,
   },
 });
 
 /**
- * Sends the user's question + relevant context chunks to Gemini 2.0 Flash
+ * Sends the user's question + relevant context chunks to Gemini
  * and gets back an answer grounded in the provided context.
  *
- * The system prompt is crucial here: it tells the LLM to ONLY answer
- * based on the provided context. Without this instruction, the LLM
- * might "hallucinate" — make up information that sounds right but
- * isn't in the PDF.
+ * Now includes page numbers and section headings in the context
+ * so the LLM can provide citations in its answers.
  *
  * @param question - The user's question
- * @param contextChunks - The top relevant chunks retrieved from the vector store
+ * @param contextChunks - The top relevant chunks from hybrid search + re-ranking
  * @returns The AI-generated answer
  */
 export async function askQuestion(
   question: string,
-  contextChunks: { text: string; score: number }[]
+  contextChunks: SearchResult[]
 ): Promise<string> {
-  // Format the context chunks into a numbered list for the LLM
+  // Format context with metadata for the LLM
   const contextText = contextChunks
-    .map((chunk, index) => `[Source ${index + 1}]:\n${chunk.text}`)
+    .map((chunk, index) => {
+      const page = chunk.metadata?.pageNumber
+        ? `Page ${chunk.metadata.pageNumber}`
+        : "Unknown page";
+      const section = chunk.metadata?.sectionHeading
+        ? ` | Section: ${chunk.metadata.sectionHeading}`
+        : "";
+      const matchInfo = chunk.matchType
+        ? ` | Found via: ${chunk.matchType} search`
+        : "";
+
+      return `[Source ${index + 1} — ${page}${section}${matchInfo}]:\n${chunk.text}`;
+    })
     .join("\n\n");
 
   const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the provided context from a PDF document.
@@ -79,16 +80,24 @@ Rules:
 - If the context doesn't contain enough information to answer, say "I don't have enough information from the PDF to answer this question."
 - Do NOT make up or infer information beyond what's explicitly stated in the context.
 - Keep your answers concise and well-structured.
-- If relevant, mention which source section the information came from.
+- When referencing information, cite the page number and section (e.g., "According to Page 5, Section 2.1...").
+- If multiple sources support your answer, mention all relevant page numbers.
 
 Context from the PDF:
 ${contextText}`;
 
-  // Combine the system instruction and user question into a single prompt
   const fullPrompt = `${systemPrompt}\n\nUser question: ${question}`;
 
-  const result = await chatModel.generateContent(fullPrompt);
-  const response = result.response;
-
-  return response.text() || "Sorry, I could not generate an answer.";
+  try {
+    const result = await chatModel.generateContent(fullPrompt);
+    return result.response.text() || "Sorry, I could not generate an answer.";
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.includes("503") || msg.includes("Service Unavailable") || msg.includes("high demand")) {
+      console.log(`⚠️  ${PRIMARY_MODEL} unavailable, falling back to ${FALLBACK_MODEL}`);
+      const result = await fallbackModel.generateContent(fullPrompt);
+      return result.response.text() || "Sorry, I could not generate an answer.";
+    }
+    throw err;
+  }
 }
