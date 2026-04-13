@@ -19,6 +19,10 @@ import pdfRoutes from "./routes/pdfRoutes";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
 
 // --- Middleware ---
 
@@ -26,7 +30,18 @@ const PORT = process.env.PORT || 5000;
 // Without this, the browser would block requests from localhost:3000 to localhost:5000
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: (origin, callback) => {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+      const cleaned = origin.replace(/\/+$/, "");
+      if (allowedOrigins.includes(cleaned)) {
+        callback(null, origin);
+        return;
+      }
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
     methods: ["GET", "POST"],
   })
 );
@@ -52,6 +67,7 @@ app.listen(PORT, () => {
   console.log(`   POST /api/upload  — Upload a PDF`);
   console.log(`   POST /api/ask     — Ask a question`);
   console.log(`   GET  /health      — Health check\n`);
+  console.log(`🌐 Allowed frontend origins: ${allowedOrigins.join(", ")}`);
 
   // Warn if Gemini API key is not set
   if (!process.env.GEMINI_API_KEY) {
