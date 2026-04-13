@@ -10,14 +10,12 @@
  * specific pages and sections in its answers, making responses
  * more trustworthy and verifiable.
  *
- * The system prompt instructs the LLM to:
- *   - Reference page numbers when citing information
- *   - Mention section headings for navigation
- *   - Indicate the match type (semantic/keyword/hybrid)
+ * Includes automatic retry with exponential backoff for rate
+ * limits (429) and model fallback for service outages (503).
  * =============================================================
  */
 
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 import { SearchResult } from "./embeddingService";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
@@ -42,21 +40,48 @@ const fallbackModel = genAI.getGenerativeModel({
 });
 
 /**
+ * Calls a Gemini model with automatic retry on 429 (rate limit).
+ * Uses exponential backoff: waits 2s, then 4s, then 8s.
+ * Gives up after maxRetries and throws the original error.
+ */
+async function callWithRetry(
+  model: GenerativeModel,
+  prompt: string,
+  maxRetries: number = 3
+): Promise<string> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await model.generateContent(prompt);
+      return result.response.text() || "Sorry, I could not generate an answer.";
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "";
+      const is429 = msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("RESOURCE_EXHAUSTED");
+
+      if (is429 && attempt < maxRetries) {
+        const waitMs = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+        console.log(`⏳ Rate limited, retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${maxRetries})...`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
+
+/**
  * Sends the user's question + relevant context chunks to Gemini
  * and gets back an answer grounded in the provided context.
  *
- * Now includes page numbers and section headings in the context
- * so the LLM can provide citations in its answers.
- *
- * @param question - The user's question
- * @param contextChunks - The top relevant chunks from hybrid search + re-ranking
- * @returns The AI-generated answer
+ * Retry strategy:
+ *   1. Try primary model (gemini-2.5-flash) with up to 3 retries
+ *   2. If 503 (overloaded), fall back to gemini-2.0-flash with retries
+ *   3. If daily quota is fully exhausted, return a clear error message
  */
 export async function askQuestion(
   question: string,
   contextChunks: SearchResult[]
 ): Promise<string> {
-  // Format context with metadata for the LLM
   const contextText = contextChunks
     .map((chunk, index) => {
       const page = chunk.metadata?.pageNumber
@@ -89,15 +114,38 @@ ${contextText}`;
   const fullPrompt = `${systemPrompt}\n\nUser question: ${question}`;
 
   try {
-    const result = await chatModel.generateContent(fullPrompt);
-    return result.response.text() || "Sorry, I could not generate an answer.";
+    return await callWithRetry(chatModel, fullPrompt);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "";
+
+    // 503: model overloaded → try fallback model
     if (msg.includes("503") || msg.includes("Service Unavailable") || msg.includes("high demand")) {
       console.log(`⚠️  ${PRIMARY_MODEL} unavailable, falling back to ${FALLBACK_MODEL}`);
-      const result = await fallbackModel.generateContent(fullPrompt);
-      return result.response.text() || "Sorry, I could not generate an answer.";
+      try {
+        return await callWithRetry(fallbackModel, fullPrompt);
+      } catch (fallbackErr: unknown) {
+        const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : "";
+        if (fbMsg.includes("429") || fbMsg.includes("quota")) {
+          throw new Error("QUOTA_EXHAUSTED");
+        }
+        throw fallbackErr;
+      }
     }
+
+    // 429 on primary after all retries → try fallback
+    if (msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("RESOURCE_EXHAUSTED")) {
+      console.log(`⚠️  ${PRIMARY_MODEL} rate limited after retries, trying ${FALLBACK_MODEL}`);
+      try {
+        return await callWithRetry(fallbackModel, fullPrompt);
+      } catch (fallbackErr: unknown) {
+        const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : "";
+        if (fbMsg.includes("429") || fbMsg.includes("quota")) {
+          throw new Error("QUOTA_EXHAUSTED");
+        }
+        throw fallbackErr;
+      }
+    }
+
     throw err;
   }
 }

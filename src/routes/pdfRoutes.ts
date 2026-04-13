@@ -219,6 +219,12 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
     console.error("Ask error:", error);
 
     if (error instanceof Error) {
+      if (error.message === "QUOTA_EXHAUSTED") {
+        res.status(429).json({
+          error: "Gemini API daily quota exhausted. The free tier limit has been reached. Please try again later or upgrade to a paid plan at https://aistudio.google.com.",
+        });
+        return;
+      }
       if (error.message.includes("API key") || error.message.includes("API_KEY")) {
         res.status(500).json({ error: "Gemini API key is invalid or missing. Check your .env file." });
         return;
