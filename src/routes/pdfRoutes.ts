@@ -275,6 +275,15 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
 // ── POST /api/ask/stream (SSE streaming response) ─────────────
 
 router.post("/ask/stream", async (req: Request, res: Response): Promise<void> => {
+  let sseStarted = false; // Track whether SSE headers have been sent
+  let clientDisconnected = false; // Track client disconnect
+
+  // Detect client disconnect mid-stream
+  req.on("close", () => {
+    clientDisconnected = true;
+    console.log("   Client disconnected mid-stream");
+  });
+
   try {
     const validated = await validateAskRequest(req, res);
     if (!validated) return;
@@ -297,13 +306,13 @@ router.post("/ask/stream", async (req: Request, res: Response): Promise<void> =>
         sources: cachedSources, searchInfo: cachedSearchInfo, cached: true,
       });
 
-      // SSE headers
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
         "Access-Control-Allow-Origin": req.headers.origin || "*",
       });
+      sseStarted = true;
 
       res.write(`data: ${JSON.stringify({ type: "chunk", text: cached.answer })}\n\n`);
       res.write(`data: ${JSON.stringify({ type: "done", sources: cachedSources, searchInfo: cachedSearchInfo, cached: true })}\n\n`);
@@ -347,19 +356,23 @@ router.post("/ask/stream", async (req: Request, res: Response): Promise<void> =>
       Connection: "keep-alive",
       "Access-Control-Allow-Origin": req.headers.origin || "*",
     });
+    sseStarted = true;
 
-    // Stream LLM tokens
+    // Stream LLM tokens (skip writes if client disconnected)
     const fullAnswer = await askQuestionStream(question, topChunks, chatHistory, (text) => {
-      res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`);
+      if (!clientDisconnected) {
+        res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`);
+      }
     });
 
     console.log(`💬 Streamed answer (${fullAnswer.length} chars)\n`);
 
-    // Send done event with sources
-    res.write(`data: ${JSON.stringify({ type: "done", sources, searchInfo, cached: false })}\n\n`);
-    res.end();
+    if (!clientDisconnected) {
+      res.write(`data: ${JSON.stringify({ type: "done", sources, searchInfo, cached: false })}\n\n`);
+      res.end();
+    }
 
-    // Save to chat history + cache (non-blocking)
+    // Save to chat history + cache regardless of disconnect
     await Chat.create({ documentId: docId, question, answer: fullAnswer, sources, searchInfo, cached: false });
     try {
       await QueryCache.create({ cacheKey, documentId: docId, question, answer: fullAnswer, sources, searchInfo });
@@ -368,7 +381,18 @@ router.post("/ask/stream", async (req: Request, res: Response): Promise<void> =>
       if (!msg.includes("duplicate key") && !msg.includes("11000")) console.error("Cache write error:", cacheErr);
     }
   } catch (error) {
-    handleAskError(error, res);
+    if (sseStarted) {
+      // Headers already sent — can't use res.status(). Send SSE error event instead.
+      const errMsg = error instanceof Error ? error.message : "Something went wrong";
+      console.error("Stream error (SSE already started):", errMsg);
+      if (!clientDisconnected) {
+        res.write(`data: ${JSON.stringify({ type: "error", error: errMsg })}\n\n`);
+        res.end();
+      }
+    } else {
+      // Headers not sent yet — safe to use normal JSON error response
+      handleAskError(error, res);
+    }
   }
 });
 
