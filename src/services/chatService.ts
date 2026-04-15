@@ -16,7 +16,7 @@
  */
 
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
-import { SearchResult } from "./embeddingService";
+import { SearchResult } from "../store/vectorStore";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 

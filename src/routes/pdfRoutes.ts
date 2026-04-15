@@ -1,24 +1,12 @@
 /**
- * pdfRoutes.ts — API Routes for PDF Upload, Query, and Chat
+ * pdfRoutes.ts — API Routes with MongoDB, Multi-Doc, Caching, Chat History
  *
- * =============================================================
- * TIER 2: Full Upgraded RAG Pipeline
- * =============================================================
- *
- * Upload flow (/api/upload):
- *   1. Receive PDF → extract text with page count
- *   2. SMART CHUNKING: recursive split (paragraphs → sentences → fixed)
- *   3. Attach METADATA: page number, section heading, chunk index
- *   4. Generate embeddings for all chunks
- *   5. Store { text, embedding, metadata } in vector store
- *
- * Query flow (/api/ask):
- *   1. Embed the user's question
- *   2. HYBRID SEARCH: combine vector + keyword search via RRF
- *   3. RE-RANK: score top candidates with multiple signals
- *   4. Send top 3 chunks (with metadata) to Gemini
- *   5. Return answer with page numbers, sections, and match types
- * =============================================================
+ * Endpoints:
+ *   POST   /api/upload            — Upload & process a PDF
+ *   POST   /api/ask               — Ask a question (with caching)
+ *   GET    /api/documents         — List all uploaded documents
+ *   GET    /api/documents/:id/chat — Get chat history for a document
+ *   DELETE /api/documents/:id     — Delete a document and all its data
  */
 
 import { Router, Request, Response } from "express";
@@ -26,39 +14,34 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import { processDocument } from "../services/pdfService";
-import { getEmbeddings, getEmbedding, hybridSearch, rerankResults } from "../services/embeddingService";
-import { addToStore, clearStore, getStore, getStoreSize } from "../store/vectorStore";
+import { getEmbeddings, getEmbedding, rerankResults } from "../services/embeddingService";
+import { addChunks, getChunkCount, deleteChunksByDocument, hybridSearchMongo } from "../store/vectorStore";
 import { askQuestion } from "../services/chatService";
+import DocumentModel from "../models/Document";
+import Chat from "../models/Chat";
+import QueryCache, { generateCacheKey } from "../models/QueryCache";
 
 const router = Router();
 
-// ── Multer File Upload Config ──────────────────────────────────
+// ── Multer Config ──────────────────────────────────────────────
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     const uploadDir = path.join(__dirname, "../../uploads");
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
     cb(null, uploadDir);
   },
   filename: (_req, file, cb) => {
-    const uniqueName = `${Date.now()}-${file.originalname}`;
-    cb(null, uniqueName);
+    cb(null, `${Date.now()}-${file.originalname}`);
   },
 });
 
 const upload = multer({
   storage,
-  limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE || "10485760"), // 10MB default
-  },
+  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE || "10485760") },
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype === "application/pdf") {
-      cb(null, true);
-    } else {
-      cb(new Error("Only PDF files are allowed"));
-    }
+    if (file.mimetype === "application/pdf") cb(null, true);
+    else cb(new Error("Only PDF files are allowed"));
   },
 });
 
@@ -66,90 +49,69 @@ const upload = multer({
 
 router.post("/upload", upload.single("pdf"), async (req: Request, res: Response): Promise<void> => {
   try {
-    if (!req.file) {
-      res.status(400).json({ error: "No PDF file uploaded" });
-      return;
-    }
+    if (!req.file) { res.status(400).json({ error: "No PDF file uploaded" }); return; }
 
-    console.log(`\n📄 Received PDF: ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)}KB)`);
+    console.log(`\n📄 Received: ${req.file.originalname} (${(req.file.size / 1024).toFixed(1)}KB)`);
 
-    // Step 1-3: Extract text, recursive chunking, attach metadata
-    console.log(`🧠 Processing with smart recursive chunking...`);
+    // 1. Extract + smart chunk
     const { chunks, totalChars } = await processDocument(req.file.path, 500, 50);
-
     if (chunks.length === 0) {
-      res.status(400).json({
-        error: "Could not extract text from PDF. The file may be image-based or empty.",
-      });
+      res.status(400).json({ error: "Could not extract text from PDF." });
       return;
     }
 
-    console.log(`📝 Extracted ${totalChars.toLocaleString()} characters`);
-    console.log(`✂️  Smart-split into ${chunks.length} chunks (recursive: paragraphs → sentences → fixed)`);
-
-    // Log chunking stats
-    const chunkLengths = chunks.map((c) => c.text.length);
-    const avgLen = Math.round(chunkLengths.reduce((a, b) => a + b, 0) / chunkLengths.length);
-    const minLen = Math.min(...chunkLengths);
-    const maxLen = Math.max(...chunkLengths);
-    console.log(`📊 Chunk sizes — avg: ${avgLen}, min: ${minLen}, max: ${maxLen} chars`);
-
-    // Count unique sections detected
-    const sections = new Set(chunks.map((c) => c.metadata.sectionHeading).filter(Boolean));
-    if (sections.size > 0) {
-      console.log(`📑 Detected ${sections.size} section heading(s)`);
-    }
-
-    // Count pages spanned
+    const sections = [...new Set(chunks.map((c) => c.metadata.sectionHeading).filter(Boolean))] as string[];
     const pages = new Set(chunks.map((c) => c.metadata.pageNumber));
-    console.log(`📖 Chunks span ${pages.size} page(s)`);
 
-    // Step 4: Generate embeddings for all chunks
+    console.log(`📝 ${totalChars.toLocaleString()} chars, ${chunks.length} chunks, ${pages.size} pages`);
+
+    // 2. Generate embeddings
     console.log(`🧮 Generating embeddings for ${chunks.length} chunks...`);
-    const chunkTexts = chunks.map((c) => c.text);
-    const embeddings = await getEmbeddings(chunkTexts);
+    const embeddings = await getEmbeddings(chunks.map((c) => c.text));
 
-    // Step 5: Store chunks + embeddings + metadata
-    clearStore();
-    const entries = chunks.map((chunk, index) => ({
+    // 3. Save document record to MongoDB
+    const doc = await DocumentModel.create({
+      filename: req.file.originalname,
+      fileSize: req.file.size,
+      totalChars,
+      totalChunks: chunks.length,
+      totalPages: pages.size,
+      sections,
+      chunkingMethod: "recursive (paragraphs → sentences → fixed-size)",
+    });
+
+    // 4. Save chunks + embeddings to MongoDB
+    const entries = chunks.map((chunk, i) => ({
       text: chunk.text,
-      embedding: embeddings[index],
+      embedding: embeddings[i],
       metadata: chunk.metadata,
     }));
-    addToStore(entries);
+    await addChunks(doc._id.toString(), entries);
 
-    console.log(`✅ Stored ${getStoreSize()} chunks in vector store\n`);
+    console.log(`✅ Stored ${await getChunkCount(doc._id.toString())} chunks in MongoDB\n`);
 
-    // Clean up uploaded file
+    // Clean up file
     fs.unlinkSync(req.file.path);
 
     res.json({
       message: "PDF processed successfully",
+      documentId: doc._id,
+      filename: doc.filename,
       chunks: chunks.length,
       characterCount: totalChars,
       pages: pages.size,
-      sections: [...sections],
-      chunkingMethod: "recursive (paragraphs → sentences → fixed-size)",
+      sections,
+      chunkingMethod: doc.chunkingMethod,
     });
   } catch (error) {
     console.error("Upload error:", error);
-
-    if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
-    }
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
 
     if (error instanceof Error) {
-      if (error.message.includes("Only PDF files")) {
-        res.status(400).json({ error: error.message });
-        return;
-      }
-      if (error.message.includes("too large") || error.message.includes("LIMIT_FILE_SIZE")) {
-        res.status(400).json({ error: "File is too large. Maximum size is 10MB." });
-        return;
-      }
+      if (error.message.includes("Only PDF files")) { res.status(400).json({ error: error.message }); return; }
+      if (error.message.includes("LIMIT_FILE_SIZE")) { res.status(400).json({ error: "File too large. Max 10MB." }); return; }
     }
-
-    res.status(500).json({ error: "Failed to process PDF. Please try again." });
+    res.status(500).json({ error: "Failed to process PDF." });
   }
 });
 
@@ -157,89 +119,203 @@ router.post("/upload", upload.single("pdf"), async (req: Request, res: Response)
 
 router.post("/ask", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { question } = req.body;
+    const { question, documentId } = req.body;
 
     if (!question || typeof question !== "string" || question.trim().length === 0) {
       res.status(400).json({ error: "Please provide a question" });
       return;
     }
 
-    if (getStoreSize() === 0) {
-      res.status(400).json({ error: "No PDF has been uploaded yet. Please upload a PDF first." });
+    // If no documentId, use the most recently uploaded document
+    let docId = documentId;
+    if (!docId) {
+      const latest = await DocumentModel.findOne().sort({ uploadedAt: -1 }).lean();
+      if (!latest) { res.status(400).json({ error: "No PDF uploaded yet." }); return; }
+      docId = latest._id.toString();
+    }
+
+    // Verify document exists
+    const docExists = await DocumentModel.findById(docId).lean();
+    if (!docExists) { res.status(404).json({ error: "Document not found." }); return; }
+
+    console.log(`\n❓ Question: "${question}" (doc: ${docExists.filename})`);
+
+    // ── Check query cache ──────────────────────────────────────
+    const cacheKey = generateCacheKey(docId, question);
+    const cached = await QueryCache.findOne({ cacheKey }).lean();
+
+    if (cached) {
+      console.log(`⚡ Cache HIT — returning cached answer`);
+
+      const cachedSources = cached.sources as Record<string, unknown>[];
+      const cachedSearchInfo = cached.searchInfo as Record<string, unknown>;
+
+      // Save to chat history as cached
+      await Chat.create({
+        documentId: docId,
+        question,
+        answer: cached.answer,
+        sources: cachedSources,
+        searchInfo: cachedSearchInfo,
+        cached: true,
+      });
+
+      res.json({
+        answer: cached.answer,
+        sources: cachedSources,
+        searchInfo: cachedSearchInfo,
+        cached: true,
+      });
       return;
     }
 
-    console.log(`\n❓ Question: "${question}"`);
+    // ── Cache MISS — run full RAG pipeline ─────────────────────
+    console.log(`🔍 Cache MISS — running hybrid search...`);
 
-    // Step 1: Embed the user's question
+    // 1. Embed the question
     const questionEmbedding = await getEmbedding(question);
 
-    // Step 2: HYBRID SEARCH — combine vector + keyword search
-    console.log(`🔀 Running hybrid search (vector + keyword)...`);
-    const hybridResults = hybridSearch(questionEmbedding, question, getStore(), 10);
+    // 2. Hybrid search (vector + text via MongoDB)
+    const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, 10);
+    console.log(`   Found ${hybridResults.length} candidates`);
 
-    const semanticCount = hybridResults.filter((r) => r.matchType === "semantic").length;
-    const keywordCount = hybridResults.filter((r) => r.matchType === "keyword").length;
-    const hybridCount = hybridResults.filter((r) => r.matchType === "hybrid").length;
-    console.log(`   Found ${hybridResults.length} candidates (${semanticCount} semantic, ${keywordCount} keyword, ${hybridCount} hybrid)`);
-
-    // Step 3: RE-RANK — score top candidates with multiple signals
-    console.log(`🏆 Re-ranking top candidates...`);
+    // 3. Re-rank
     const topChunks = rerankResults(question, hybridResults, 3);
 
-    console.log(`🔍 Final top ${topChunks.length} chunks:`);
-    topChunks.forEach((chunk, i) => {
-      const page = chunk.metadata?.pageNumber || "?";
-      const section = chunk.metadata?.sectionHeading || "none";
-      console.log(`   ${i + 1}. Page ${page} | ${section} | score: ${chunk.score.toFixed(4)} | via: ${chunk.matchType}`);
+    topChunks.forEach((c, i) => {
+      console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
     });
 
-    // Step 4: Send re-ranked chunks + question to Gemini
+    // 4. Generate answer
     const answer = await askQuestion(question, topChunks);
+    console.log(`💬 Answer generated (${answer.length} chars)\n`);
 
-    console.log(`💬 Generated answer (${answer.length} chars)\n`);
+    const sources = topChunks.map((c) => ({
+      text: c.text,
+      relevanceScore: parseFloat(c.score.toFixed(4)),
+      pageNumber: c.metadata?.pageNumber || null,
+      sectionHeading: c.metadata?.sectionHeading || null,
+      matchType: c.matchType,
+    }));
 
-    // Return answer with full metadata
-    res.json({
+    const searchInfo = {
+      method: "hybrid (vector + keyword) with re-ranking",
+      candidatesEvaluated: hybridResults.length,
+      finalResults: topChunks.length,
+    };
+
+    // Save to chat history
+    await Chat.create({
+      documentId: docId,
+      question,
       answer,
-      sources: topChunks.map((chunk) => ({
-        text: chunk.text,
-        relevanceScore: parseFloat(chunk.score.toFixed(4)),
-        pageNumber: chunk.metadata?.pageNumber || null,
-        sectionHeading: chunk.metadata?.sectionHeading || null,
-        matchType: chunk.matchType,
-      })),
-      searchInfo: {
-        method: "hybrid (vector + keyword) with re-ranking",
-        candidatesEvaluated: hybridResults.length,
-        finalResults: topChunks.length,
-      },
+      sources,
+      searchInfo,
+      cached: false,
     });
+
+    // Save to query cache (ignore duplicate key errors)
+    try {
+      await QueryCache.create({
+        cacheKey,
+        documentId: docId,
+        question,
+        answer,
+        sources,
+        searchInfo,
+      });
+    } catch (cacheErr: unknown) {
+      const msg = cacheErr instanceof Error ? cacheErr.message : "";
+      if (!msg.includes("duplicate key") && !msg.includes("11000")) {
+        console.error("Cache write error:", cacheErr);
+      }
+    }
+
+    res.json({ answer, sources, searchInfo, cached: false });
   } catch (error) {
     console.error("Ask error:", error);
 
     if (error instanceof Error) {
       if (error.message === "QUOTA_EXHAUSTED") {
-        res.status(429).json({
-          error: "Gemini API daily quota exhausted. The free tier limit has been reached. Please try again later or upgrade to a paid plan at https://aistudio.google.com.",
-        });
+        res.status(429).json({ error: "Gemini API daily quota exhausted. Try again later or upgrade at https://aistudio.google.com." });
         return;
       }
       if (error.message.includes("API key") || error.message.includes("API_KEY")) {
-        res.status(500).json({ error: "Gemini API key is invalid or missing. Check your .env file." });
+        res.status(500).json({ error: "Gemini API key is invalid or missing." });
         return;
       }
-      if (error.message.includes("rate limit") || error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
-        res.status(429).json({ error: "Rate limited by Gemini. Please wait a moment and try again." });
+      if (error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
+        res.status(429).json({ error: "Rate limited by Gemini. Wait a moment and try again." });
         return;
       }
-      if (error.message.includes("503") || error.message.includes("Service Unavailable") || error.message.includes("high demand")) {
-        res.status(503).json({ error: "Gemini model is currently overloaded. Please try again in a few seconds." });
+      if (error.message.includes("503") || error.message.includes("Service Unavailable")) {
+        res.status(503).json({ error: "Gemini model overloaded. Try again shortly." });
         return;
       }
     }
+    res.status(500).json({ error: "Failed to process your question." });
+  }
+});
 
-    res.status(500).json({ error: "Failed to process your question. Please try again." });
+// ── GET /api/documents ─────────────────────────────────────────
+
+router.get("/documents", async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const documents = await DocumentModel.find()
+      .sort({ uploadedAt: -1 })
+      .select("filename fileSize totalChunks totalPages sections uploadedAt")
+      .lean();
+
+    res.json({ documents });
+  } catch (error) {
+    console.error("List documents error:", error);
+    res.status(500).json({ error: "Failed to list documents." });
+  }
+});
+
+// ── GET /api/documents/:id/chat ────────────────────────────────
+
+router.get("/documents/:id/chat", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    const doc = await DocumentModel.findById(id).lean();
+    if (!doc) { res.status(404).json({ error: "Document not found." }); return; }
+
+    const messages = await Chat.find({ documentId: id })
+      .sort({ createdAt: 1 })
+      .select("question answer sources searchInfo cached createdAt")
+      .lean();
+
+    res.json({ documentId: id, filename: doc.filename, messages });
+  } catch (error) {
+    console.error("Chat history error:", error);
+    res.status(500).json({ error: "Failed to load chat history." });
+  }
+});
+
+// ── DELETE /api/documents/:id ──────────────────────────────────
+
+router.delete("/documents/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const id = req.params.id as string;
+
+    const doc = await DocumentModel.findById(id).lean();
+    if (!doc) { res.status(404).json({ error: "Document not found." }); return; }
+
+    // Delete everything related to this document
+    await Promise.all([
+      DocumentModel.deleteOne({ _id: id }),
+      deleteChunksByDocument(id),
+      Chat.deleteMany({ documentId: id }),
+      QueryCache.deleteMany({ documentId: id }),
+    ]);
+
+    console.log(`🗑️  Deleted document "${doc.filename}" and all related data`);
+    res.json({ message: `Deleted "${doc.filename}" successfully.` });
+  } catch (error) {
+    console.error("Delete error:", error);
+    res.status(500).json({ error: "Failed to delete document." });
   }
 });
 
