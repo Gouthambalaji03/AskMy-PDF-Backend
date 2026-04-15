@@ -1,18 +1,12 @@
 /**
- * chatService.ts — LLM Chat Completion with Context (Google Gemini)
+ * chatService.ts — LLM Chat with Streaming, Conversational Memory & Fallback
  *
- * =============================================================
- * TIER 2: Metadata-Aware Prompt Engineering
- * =============================================================
- *
- * Updated to include chunk metadata (page number, section heading)
- * in the context sent to the LLM. This allows the AI to cite
- * specific pages and sections in its answers, making responses
- * more trustworthy and verifiable.
- *
- * Includes automatic retry with exponential backoff for rate
- * limits (429) and model fallback for service outages (503).
- * =============================================================
+ * Features:
+ *   - Streaming responses via SSE (Server-Sent Events)
+ *   - Conversational memory (last N Q&A pairs sent as context)
+ *   - Retry with exponential backoff on 429
+ *   - Model fallback: gemini-2.5-flash → gemini-2.0-flash
+ *   - Metadata-aware prompts with page/section citations
  */
 
 import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
@@ -39,11 +33,64 @@ const fallbackModel = genAI.getGenerativeModel({
   },
 });
 
-/**
- * Calls a Gemini model with automatic retry on 429 (rate limit).
- * Uses exponential backoff: waits 2s, then 4s, then 8s.
- * Gives up after maxRetries and throws the original error.
- */
+// ── Conversation History Type ─────────────────────────────────
+
+export interface ChatTurn {
+  question: string;
+  answer: string;
+}
+
+// ── Prompt Builder ────────────────────────────────────────────
+
+function buildPrompt(
+  question: string,
+  contextChunks: SearchResult[],
+  chatHistory: ChatTurn[] = []
+): string {
+  const contextText = contextChunks
+    .map((chunk, index) => {
+      const page = chunk.metadata?.pageNumber
+        ? `Page ${chunk.metadata.pageNumber}`
+        : "Unknown page";
+      const section = chunk.metadata?.sectionHeading
+        ? ` | Section: ${chunk.metadata.sectionHeading}`
+        : "";
+      const matchInfo = chunk.matchType
+        ? ` | Found via: ${chunk.matchType} search`
+        : "";
+      return `[Source ${index + 1} — ${page}${section}${matchInfo}]:\n${chunk.text}`;
+    })
+    .join("\n\n");
+
+  // Build conversation history section
+  let historySection = "";
+  if (chatHistory.length > 0) {
+    historySection = "\n\nPrevious conversation:\n" +
+      chatHistory.map((turn) =>
+        `User: ${turn.question}\nAssistant: ${turn.answer}`
+      ).join("\n\n") +
+      "\n";
+  }
+
+  const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the provided context from a PDF document.
+
+Rules:
+- Only use information from the context below to answer the question.
+- If the context doesn't contain enough information to answer, say "I don't have enough information from the PDF to answer this question."
+- Do NOT make up or infer information beyond what's explicitly stated in the context.
+- Keep your answers concise and well-structured.
+- When referencing information, cite the page number and section (e.g., "According to Page 5, Section 2.1...").
+- If multiple sources support your answer, mention all relevant page numbers.
+- Use the previous conversation (if any) to understand follow-up questions. Resolve pronouns like "it", "this", "that" using prior context.
+
+Context from the PDF:
+${contextText}${historySection}`;
+
+  return `${systemPrompt}\n\nUser question: ${question}`;
+}
+
+// ── Retry Logic ───────────────────────────────────────────────
+
 async function callWithRetry(
   model: GenerativeModel,
   prompt: string,
@@ -58,7 +105,7 @@ async function callWithRetry(
       const is429 = msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("RESOURCE_EXHAUSTED");
 
       if (is429 && attempt < maxRetries) {
-        const waitMs = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+        const waitMs = Math.pow(2, attempt + 1) * 1000;
         console.log(`⏳ Rate limited, retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${maxRetries})...`);
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         continue;
@@ -69,79 +116,93 @@ async function callWithRetry(
   throw new Error("Max retries exceeded");
 }
 
-/**
- * Sends the user's question + relevant context chunks to Gemini
- * and gets back an answer grounded in the provided context.
- *
- * Retry strategy:
- *   1. Try primary model (gemini-2.5-flash) with up to 3 retries
- *   2. If 503 (overloaded), fall back to gemini-2.0-flash with retries
- *   3. If daily quota is fully exhausted, return a clear error message
- */
+// ── Non-Streaming (kept for cache hits) ───────────────────────
+
 export async function askQuestion(
   question: string,
-  contextChunks: SearchResult[]
+  contextChunks: SearchResult[],
+  chatHistory: ChatTurn[] = []
 ): Promise<string> {
-  const contextText = contextChunks
-    .map((chunk, index) => {
-      const page = chunk.metadata?.pageNumber
-        ? `Page ${chunk.metadata.pageNumber}`
-        : "Unknown page";
-      const section = chunk.metadata?.sectionHeading
-        ? ` | Section: ${chunk.metadata.sectionHeading}`
-        : "";
-      const matchInfo = chunk.matchType
-        ? ` | Found via: ${chunk.matchType} search`
-        : "";
-
-      return `[Source ${index + 1} — ${page}${section}${matchInfo}]:\n${chunk.text}`;
-    })
-    .join("\n\n");
-
-  const systemPrompt = `You are a helpful assistant that answers questions based ONLY on the provided context from a PDF document.
-
-Rules:
-- Only use information from the context below to answer the question.
-- If the context doesn't contain enough information to answer, say "I don't have enough information from the PDF to answer this question."
-- Do NOT make up or infer information beyond what's explicitly stated in the context.
-- Keep your answers concise and well-structured.
-- When referencing information, cite the page number and section (e.g., "According to Page 5, Section 2.1...").
-- If multiple sources support your answer, mention all relevant page numbers.
-
-Context from the PDF:
-${contextText}`;
-
-  const fullPrompt = `${systemPrompt}\n\nUser question: ${question}`;
+  const fullPrompt = buildPrompt(question, contextChunks, chatHistory);
 
   try {
     return await callWithRetry(chatModel, fullPrompt);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "";
 
-    // 503: model overloaded → try fallback model
     if (msg.includes("503") || msg.includes("Service Unavailable") || msg.includes("high demand")) {
       console.log(`⚠️  ${PRIMARY_MODEL} unavailable, falling back to ${FALLBACK_MODEL}`);
       try {
         return await callWithRetry(fallbackModel, fullPrompt);
       } catch (fallbackErr: unknown) {
         const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : "";
-        if (fbMsg.includes("429") || fbMsg.includes("quota")) {
-          throw new Error("QUOTA_EXHAUSTED");
-        }
+        if (fbMsg.includes("429") || fbMsg.includes("quota")) throw new Error("QUOTA_EXHAUSTED");
         throw fallbackErr;
       }
     }
 
-    // 429 on primary after all retries → try fallback
     if (msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("RESOURCE_EXHAUSTED")) {
       console.log(`⚠️  ${PRIMARY_MODEL} rate limited after retries, trying ${FALLBACK_MODEL}`);
       try {
         return await callWithRetry(fallbackModel, fullPrompt);
       } catch (fallbackErr: unknown) {
         const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : "";
-        if (fbMsg.includes("429") || fbMsg.includes("quota")) {
-          throw new Error("QUOTA_EXHAUSTED");
-        }
+        if (fbMsg.includes("429") || fbMsg.includes("quota")) throw new Error("QUOTA_EXHAUSTED");
+        throw fallbackErr;
+      }
+    }
+
+    throw err;
+  }
+}
+
+// ── Streaming Response ────────────────────────────────────────
+
+/**
+ * Streams the LLM response chunk-by-chunk via a callback.
+ * Falls back to the secondary model on 503/429.
+ * Returns the full assembled answer when done.
+ */
+export async function askQuestionStream(
+  question: string,
+  contextChunks: SearchResult[],
+  chatHistory: ChatTurn[] = [],
+  onChunk: (text: string) => void
+): Promise<string> {
+  const fullPrompt = buildPrompt(question, contextChunks, chatHistory);
+
+  async function streamFromModel(model: GenerativeModel): Promise<string> {
+    const result = await model.generateContentStream(fullPrompt);
+    let fullText = "";
+
+    for await (const chunk of result.stream) {
+      const text = chunk.text();
+      if (text) {
+        fullText += text;
+        onChunk(text);
+      }
+    }
+
+    return fullText || "Sorry, I could not generate an answer.";
+  }
+
+  // Try primary model
+  try {
+    return await streamFromModel(chatModel);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "";
+
+    const shouldFallback =
+      msg.includes("503") || msg.includes("Service Unavailable") || msg.includes("high demand") ||
+      msg.includes("429") || msg.includes("Too Many Requests") || msg.includes("RESOURCE_EXHAUSTED");
+
+    if (shouldFallback) {
+      console.log(`⚠️  ${PRIMARY_MODEL} failed for streaming, falling back to ${FALLBACK_MODEL}`);
+      try {
+        return await streamFromModel(fallbackModel);
+      } catch (fallbackErr: unknown) {
+        const fbMsg = fallbackErr instanceof Error ? fallbackErr.message : "";
+        if (fbMsg.includes("429") || fbMsg.includes("quota")) throw new Error("QUOTA_EXHAUSTED");
         throw fallbackErr;
       }
     }

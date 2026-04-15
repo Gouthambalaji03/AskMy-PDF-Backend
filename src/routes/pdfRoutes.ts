@@ -16,10 +16,15 @@ import fs from "fs";
 import { processDocument } from "../services/pdfService";
 import { getEmbeddings, getEmbedding, rerankResults } from "../services/embeddingService";
 import { addChunks, getChunkCount, deleteChunksByDocument, hybridSearchMongo } from "../store/vectorStore";
-import { askQuestion } from "../services/chatService";
+import { askQuestion, askQuestionStream, ChatTurn } from "../services/chatService";
 import DocumentModel from "../models/Document";
 import Chat from "../models/Chat";
 import QueryCache, { generateCacheKey } from "../models/QueryCache";
+
+// ── Constants ─────────────────────────────────────────────────
+
+const MAX_QUESTION_LENGTH = 1000;
+const CHAT_HISTORY_LIMIT = 5; // last N Q&A pairs sent as conversational memory
 
 const router = Router();
 
@@ -115,30 +120,91 @@ router.post("/upload", upload.single("pdf"), async (req: Request, res: Response)
   }
 });
 
-// ── POST /api/ask ──────────────────────────────────────────────
+// ── Shared: Validate + resolve question request ──────────────
+
+async function validateAskRequest(req: Request, res: Response) {
+  const { question, documentId } = req.body;
+
+  if (!question || typeof question !== "string" || question.trim().length === 0) {
+    res.status(400).json({ error: "Please provide a question." });
+    return null;
+  }
+
+  if (question.trim().length > MAX_QUESTION_LENGTH) {
+    res.status(400).json({ error: `Question too long. Maximum ${MAX_QUESTION_LENGTH} characters.` });
+    return null;
+  }
+
+  let docId = documentId;
+  if (!docId) {
+    const latest = await DocumentModel.findOne().sort({ uploadedAt: -1 }).lean();
+    if (!latest) { res.status(400).json({ error: "No PDF uploaded yet." }); return null; }
+    docId = latest._id.toString();
+  }
+
+  // Validate ObjectId format
+  if (!/^[a-f\d]{24}$/i.test(docId)) {
+    res.status(400).json({ error: "Invalid document ID format." });
+    return null;
+  }
+
+  const doc = await DocumentModel.findById(docId).lean();
+  if (!doc) { res.status(404).json({ error: "Document not found." }); return null; }
+
+  return { question: question.trim(), docId, doc };
+}
+
+// ── Shared: Load chat history for conversational memory ───────
+
+async function loadChatMemory(docId: string): Promise<ChatTurn[]> {
+  const recentChats = await Chat.find({ documentId: docId })
+    .sort({ createdAt: -1 })
+    .limit(CHAT_HISTORY_LIMIT)
+    .select("question answer")
+    .lean();
+
+  // Reverse so oldest is first (chronological order)
+  return recentChats.reverse().map((c) => ({
+    question: c.question,
+    answer: c.answer.slice(0, 300), // Truncate long answers to save tokens
+  }));
+}
+
+// ── Shared: Handle ask errors ─────────────────────────────────
+
+function handleAskError(error: unknown, res: Response) {
+  console.error("Ask error:", error);
+
+  if (error instanceof Error) {
+    if (error.message === "QUOTA_EXHAUSTED") {
+      res.status(429).json({ error: "Gemini API daily quota exhausted. Try again later." });
+      return;
+    }
+    if (error.message.includes("API key") || error.message.includes("API_KEY")) {
+      res.status(500).json({ error: "Gemini API key is invalid or missing." });
+      return;
+    }
+    if (error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
+      res.status(429).json({ error: "Rate limited by Gemini. Wait a moment and try again." });
+      return;
+    }
+    if (error.message.includes("503") || error.message.includes("Service Unavailable")) {
+      res.status(503).json({ error: "Gemini model overloaded. Try again shortly." });
+      return;
+    }
+  }
+  res.status(500).json({ error: "Failed to process your question." });
+}
+
+// ── POST /api/ask (non-streaming, used for cache hits) ────────
 
 router.post("/ask", async (req: Request, res: Response): Promise<void> => {
   try {
-    const { question, documentId } = req.body;
+    const validated = await validateAskRequest(req, res);
+    if (!validated) return;
+    const { question, docId, doc } = validated;
 
-    if (!question || typeof question !== "string" || question.trim().length === 0) {
-      res.status(400).json({ error: "Please provide a question" });
-      return;
-    }
-
-    // If no documentId, use the most recently uploaded document
-    let docId = documentId;
-    if (!docId) {
-      const latest = await DocumentModel.findOne().sort({ uploadedAt: -1 }).lean();
-      if (!latest) { res.status(400).json({ error: "No PDF uploaded yet." }); return; }
-      docId = latest._id.toString();
-    }
-
-    // Verify document exists
-    const docExists = await DocumentModel.findById(docId).lean();
-    if (!docExists) { res.status(404).json({ error: "Document not found." }); return; }
-
-    console.log(`\n❓ Question: "${question}" (doc: ${docExists.filename})`);
+    console.log(`\n❓ Question: "${question}" (doc: ${doc.filename})`);
 
     // ── Check query cache ──────────────────────────────────────
     const cacheKey = generateCacheKey(docId, question);
@@ -150,44 +216,31 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
       const cachedSources = cached.sources as Record<string, unknown>[];
       const cachedSearchInfo = cached.searchInfo as Record<string, unknown>;
 
-      // Save to chat history as cached
       await Chat.create({
-        documentId: docId,
-        question,
-        answer: cached.answer,
-        sources: cachedSources,
-        searchInfo: cachedSearchInfo,
-        cached: true,
+        documentId: docId, question, answer: cached.answer,
+        sources: cachedSources, searchInfo: cachedSearchInfo, cached: true,
       });
 
-      res.json({
-        answer: cached.answer,
-        sources: cachedSources,
-        searchInfo: cachedSearchInfo,
-        cached: true,
-      });
+      res.json({ answer: cached.answer, sources: cachedSources, searchInfo: cachedSearchInfo, cached: true });
       return;
     }
 
     // ── Cache MISS — run full RAG pipeline ─────────────────────
     console.log(`🔍 Cache MISS — running hybrid search...`);
 
-    // 1. Embed the question
-    const questionEmbedding = await getEmbedding(question);
+    const chatHistory = await loadChatMemory(docId);
+    if (chatHistory.length > 0) console.log(`💬 Conversational memory: ${chatHistory.length} previous turns`);
 
-    // 2. Hybrid search (vector + text via MongoDB)
+    const questionEmbedding = await getEmbedding(question);
     const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, 10);
     console.log(`   Found ${hybridResults.length} candidates`);
 
-    // 3. Re-rank
     const topChunks = rerankResults(question, hybridResults, 3);
-
     topChunks.forEach((c, i) => {
       console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
     });
 
-    // 4. Generate answer
-    const answer = await askQuestion(question, topChunks);
+    const answer = await askQuestion(question, topChunks, chatHistory);
     console.log(`💬 Answer generated (${answer.length} chars)\n`);
 
     const sources = topChunks.map((c) => ({
@@ -204,56 +257,118 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
       finalResults: topChunks.length,
     };
 
-    // Save to chat history
-    await Chat.create({
-      documentId: docId,
-      question,
-      answer,
-      sources,
-      searchInfo,
-      cached: false,
-    });
+    await Chat.create({ documentId: docId, question, answer, sources, searchInfo, cached: false });
 
-    // Save to query cache (ignore duplicate key errors)
     try {
-      await QueryCache.create({
-        cacheKey,
-        documentId: docId,
-        question,
-        answer,
-        sources,
-        searchInfo,
-      });
+      await QueryCache.create({ cacheKey, documentId: docId, question, answer, sources, searchInfo });
     } catch (cacheErr: unknown) {
       const msg = cacheErr instanceof Error ? cacheErr.message : "";
-      if (!msg.includes("duplicate key") && !msg.includes("11000")) {
-        console.error("Cache write error:", cacheErr);
-      }
+      if (!msg.includes("duplicate key") && !msg.includes("11000")) console.error("Cache write error:", cacheErr);
     }
 
     res.json({ answer, sources, searchInfo, cached: false });
   } catch (error) {
-    console.error("Ask error:", error);
+    handleAskError(error, res);
+  }
+});
 
-    if (error instanceof Error) {
-      if (error.message === "QUOTA_EXHAUSTED") {
-        res.status(429).json({ error: "Gemini API daily quota exhausted. Try again later or upgrade at https://aistudio.google.com." });
-        return;
-      }
-      if (error.message.includes("API key") || error.message.includes("API_KEY")) {
-        res.status(500).json({ error: "Gemini API key is invalid or missing." });
-        return;
-      }
-      if (error.message.includes("429") || error.message.includes("RESOURCE_EXHAUSTED")) {
-        res.status(429).json({ error: "Rate limited by Gemini. Wait a moment and try again." });
-        return;
-      }
-      if (error.message.includes("503") || error.message.includes("Service Unavailable")) {
-        res.status(503).json({ error: "Gemini model overloaded. Try again shortly." });
-        return;
-      }
+// ── POST /api/ask/stream (SSE streaming response) ─────────────
+
+router.post("/ask/stream", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const validated = await validateAskRequest(req, res);
+    if (!validated) return;
+    const { question, docId, doc } = validated;
+
+    console.log(`\n❓ [STREAM] Question: "${question}" (doc: ${doc.filename})`);
+
+    // ── Check query cache — return full answer as single SSE ───
+    const cacheKey = generateCacheKey(docId, question);
+    const cached = await QueryCache.findOne({ cacheKey }).lean();
+
+    if (cached) {
+      console.log(`⚡ Cache HIT — streaming cached answer`);
+
+      const cachedSources = cached.sources as Record<string, unknown>[];
+      const cachedSearchInfo = cached.searchInfo as Record<string, unknown>;
+
+      await Chat.create({
+        documentId: docId, question, answer: cached.answer,
+        sources: cachedSources, searchInfo: cachedSearchInfo, cached: true,
+      });
+
+      // SSE headers
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "Access-Control-Allow-Origin": req.headers.origin || "*",
+      });
+
+      res.write(`data: ${JSON.stringify({ type: "chunk", text: cached.answer })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: "done", sources: cachedSources, searchInfo: cachedSearchInfo, cached: true })}\n\n`);
+      res.end();
+      return;
     }
-    res.status(500).json({ error: "Failed to process your question." });
+
+    // ── Cache MISS — stream from LLM ──────────────────────────
+    console.log(`🔍 Cache MISS — running hybrid search...`);
+
+    const chatHistory = await loadChatMemory(docId);
+    if (chatHistory.length > 0) console.log(`💬 Conversational memory: ${chatHistory.length} previous turns`);
+
+    const questionEmbedding = await getEmbedding(question);
+    const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, 10);
+    console.log(`   Found ${hybridResults.length} candidates`);
+
+    const topChunks = rerankResults(question, hybridResults, 3);
+    topChunks.forEach((c, i) => {
+      console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
+    });
+
+    const sources = topChunks.map((c) => ({
+      text: c.text,
+      relevanceScore: parseFloat(c.score.toFixed(4)),
+      pageNumber: c.metadata?.pageNumber || null,
+      sectionHeading: c.metadata?.sectionHeading || null,
+      matchType: c.matchType,
+    }));
+
+    const searchInfo = {
+      method: "hybrid (vector + keyword) with re-ranking",
+      candidatesEvaluated: hybridResults.length,
+      finalResults: topChunks.length,
+    };
+
+    // SSE headers
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": req.headers.origin || "*",
+    });
+
+    // Stream LLM tokens
+    const fullAnswer = await askQuestionStream(question, topChunks, chatHistory, (text) => {
+      res.write(`data: ${JSON.stringify({ type: "chunk", text })}\n\n`);
+    });
+
+    console.log(`💬 Streamed answer (${fullAnswer.length} chars)\n`);
+
+    // Send done event with sources
+    res.write(`data: ${JSON.stringify({ type: "done", sources, searchInfo, cached: false })}\n\n`);
+    res.end();
+
+    // Save to chat history + cache (non-blocking)
+    await Chat.create({ documentId: docId, question, answer: fullAnswer, sources, searchInfo, cached: false });
+    try {
+      await QueryCache.create({ cacheKey, documentId: docId, question, answer: fullAnswer, sources, searchInfo });
+    } catch (cacheErr: unknown) {
+      const msg = cacheErr instanceof Error ? cacheErr.message : "";
+      if (!msg.includes("duplicate key") && !msg.includes("11000")) console.error("Cache write error:", cacheErr);
+    }
+  } catch (error) {
+    handleAskError(error, res);
   }
 });
 
