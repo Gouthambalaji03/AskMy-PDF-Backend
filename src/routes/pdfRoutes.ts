@@ -17,6 +17,8 @@ import { processDocument } from "../services/pdfService";
 import { getEmbeddings, getEmbedding, rerankResults } from "../services/embeddingService";
 import { addChunks, getChunkCount, deleteChunksByDocument, hybridSearchMongo } from "../store/vectorStore";
 import { askQuestion, askQuestionStream, ChatTurn } from "../services/chatService";
+import { gradeRelevance, rewriteQuery, CRAGInfo } from "../services/agenticService";
+import { SearchResult } from "../store/vectorStore";
 import DocumentModel from "../models/Document";
 import Chat from "../models/Chat";
 import QueryCache, { generateCacheKey } from "../models/QueryCache";
@@ -170,6 +172,104 @@ async function loadChatMemory(docId: string): Promise<ChatTurn[]> {
   }));
 }
 
+// ── Shared: CRAG retrieval (hybrid search + self-correction) ──
+
+/**
+ * Runs the CRAG retrieval loop:
+ *   1. Hybrid search + re-rank (existing pipeline)
+ *   2. Grade whether retrieved chunks can answer the question
+ *   3. If low confidence → rewrite query → re-retrieve → re-grade
+ *
+ * Returns the best chunks found, plus metadata about what CRAG did
+ * (for logging, UI badges, and debugging).
+ */
+async function retrieveWithCRAG(
+  question: string,
+  docId: string,
+  topK: number = 10,
+  finalTopN: number = 3
+): Promise<{
+  topChunks: SearchResult[];
+  candidatesEvaluated: number;
+  cragInfo: CRAGInfo;
+}> {
+  // Step 1: Initial retrieval
+  const questionEmbedding = await getEmbedding(question);
+  const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, topK);
+  console.log(`   Found ${hybridResults.length} candidates`);
+  const topChunks = rerankResults(question, hybridResults, finalTopN);
+  topChunks.forEach((c, i) => {
+    console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
+  });
+
+  // Step 2: Grade the initial retrieval
+  const grade = await gradeRelevance(question, topChunks);
+  console.log(`   🧠 CRAG grade: ${grade.confidence.toUpperCase()} — ${grade.reason}`);
+
+  if (grade.confidence === "high") {
+    return {
+      topChunks,
+      candidatesEvaluated: hybridResults.length,
+      cragInfo: {
+        triggered: false,
+        initialConfidence: "high",
+        finalConfidence: "high",
+        rewrittenQuery: null,
+        reason: grade.reason,
+      },
+    };
+  }
+
+  // Step 3: Rewrite query and retry
+  const rewrittenQuery = await rewriteQuery(question, grade.reason);
+  const didRewrite = rewrittenQuery !== question;
+
+  if (!didRewrite) {
+    // Rewriter returned original (or failed) — no point retrying
+    console.log(`   ✍️  CRAG skipped retry (query unchanged)`);
+    return {
+      topChunks,
+      candidatesEvaluated: hybridResults.length,
+      cragInfo: {
+        triggered: false,
+        initialConfidence: "low",
+        finalConfidence: "low",
+        rewrittenQuery: null,
+        reason: grade.reason,
+      },
+    };
+  }
+
+  console.log(`   ✍️  CRAG rewrite: "${rewrittenQuery}"`);
+
+  // Step 4: Re-retrieve with the rewritten query
+  const newEmbedding = await getEmbedding(rewrittenQuery);
+  const newHybridResults = await hybridSearchMongo(newEmbedding, rewrittenQuery, docId, topK);
+  const newTopChunks = rerankResults(rewrittenQuery, newHybridResults, finalTopN);
+  console.log(`   Found ${newHybridResults.length} candidates (after rewrite)`);
+  newTopChunks.forEach((c, i) => {
+    console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
+  });
+
+  // Step 5: Grade again — using the ORIGINAL question (that's what user wants answered)
+  const newGrade = await gradeRelevance(question, newTopChunks);
+  console.log(`   🧠 CRAG grade (after rewrite): ${newGrade.confidence.toUpperCase()} — ${newGrade.reason}`);
+
+  // Pick whichever set looks better. If the rewrite gave us high confidence, use it.
+  // If still low, use the rewrite results anyway (they may be better than nothing).
+  return {
+    topChunks: newTopChunks,
+    candidatesEvaluated: hybridResults.length + newHybridResults.length,
+    cragInfo: {
+      triggered: true,
+      initialConfidence: "low",
+      finalConfidence: newGrade.confidence,
+      rewrittenQuery,
+      reason: newGrade.reason,
+    },
+  };
+}
+
 // ── Shared: Handle ask errors ─────────────────────────────────
 
 function handleAskError(error: unknown, res: Response) {
@@ -225,20 +325,13 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // ── Cache MISS — run full RAG pipeline ─────────────────────
+    // ── Cache MISS — run full RAG pipeline with CRAG ───────────
     console.log(`🔍 Cache MISS — running hybrid search...`);
 
     const chatHistory = await loadChatMemory(docId);
     if (chatHistory.length > 0) console.log(`💬 Conversational memory: ${chatHistory.length} previous turns`);
 
-    const questionEmbedding = await getEmbedding(question);
-    const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, 10);
-    console.log(`   Found ${hybridResults.length} candidates`);
-
-    const topChunks = rerankResults(question, hybridResults, 3);
-    topChunks.forEach((c, i) => {
-      console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
-    });
+    const { topChunks, candidatesEvaluated, cragInfo } = await retrieveWithCRAG(question, docId, 10, 3);
 
     const answer = await askQuestion(question, topChunks, chatHistory);
     console.log(`💬 Answer generated (${answer.length} chars)\n`);
@@ -252,9 +345,12 @@ router.post("/ask", async (req: Request, res: Response): Promise<void> => {
     }));
 
     const searchInfo = {
-      method: "hybrid (vector + keyword) with re-ranking",
-      candidatesEvaluated: hybridResults.length,
+      method: cragInfo.triggered
+        ? "hybrid + re-ranking + CRAG self-correction"
+        : "hybrid (vector + keyword) with re-ranking",
+      candidatesEvaluated,
       finalResults: topChunks.length,
+      crag: cragInfo,
     };
 
     await Chat.create({ documentId: docId, question, answer, sources, searchInfo, cached: false });
@@ -320,20 +416,13 @@ router.post("/ask/stream", async (req: Request, res: Response): Promise<void> =>
       return;
     }
 
-    // ── Cache MISS — stream from LLM ──────────────────────────
+    // ── Cache MISS — stream from LLM (with CRAG self-correction) ──
     console.log(`🔍 Cache MISS — running hybrid search...`);
 
     const chatHistory = await loadChatMemory(docId);
     if (chatHistory.length > 0) console.log(`💬 Conversational memory: ${chatHistory.length} previous turns`);
 
-    const questionEmbedding = await getEmbedding(question);
-    const hybridResults = await hybridSearchMongo(questionEmbedding, question, docId, 10);
-    console.log(`   Found ${hybridResults.length} candidates`);
-
-    const topChunks = rerankResults(question, hybridResults, 3);
-    topChunks.forEach((c, i) => {
-      console.log(`   ${i + 1}. Page ${c.metadata?.pageNumber || "?"} | score: ${c.score.toFixed(4)} | ${c.matchType}`);
-    });
+    const { topChunks, candidatesEvaluated, cragInfo } = await retrieveWithCRAG(question, docId, 10, 3);
 
     const sources = topChunks.map((c) => ({
       text: c.text,
@@ -344,9 +433,12 @@ router.post("/ask/stream", async (req: Request, res: Response): Promise<void> =>
     }));
 
     const searchInfo = {
-      method: "hybrid (vector + keyword) with re-ranking",
-      candidatesEvaluated: hybridResults.length,
+      method: cragInfo.triggered
+        ? "hybrid + re-ranking + CRAG self-correction"
+        : "hybrid (vector + keyword) with re-ranking",
+      candidatesEvaluated,
       finalResults: topChunks.length,
+      crag: cragInfo,
     };
 
     // SSE headers
